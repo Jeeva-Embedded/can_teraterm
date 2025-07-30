@@ -7,15 +7,14 @@ import io
 import matplotlib.pyplot as plt
 from tempfile import NamedTemporaryFile
 import serial.tools.list_ports
+from datetime import datetime
+import threading
 
 # Helper to decode signed 16-bit integers (big endian)
 def decode_signed_16bit(b1, b2):
     return struct.unpack(">h", bytes([b1, b2]))[0]
 
-# Constants for machine types
-CARDING = 1
-DF = 2
-FLYER = 3
+CARDING, DF, FLYER = 1, 2, 3
 
 st.set_page_config(layout="wide")
 st.title("📡 CAN Logger, Decoder, and Visualizer")
@@ -25,26 +24,16 @@ st.sidebar.header("CAN Setup")
 
 # Detect available serial ports
 def get_available_ports():
-    ports = serial.tools.list_ports.comports()
-    return [port.device for port in ports]
+    return [port.device for port in serial.tools.list_ports.comports()]
 
 available_ports = get_available_ports()
-
-if available_ports:
-    serial_port = st.sidebar.selectbox("Select Serial Port", available_ports)
-else:
+serial_port = st.sidebar.selectbox("Select Serial Port", available_ports) if available_ports else None
+if not serial_port:
     st.sidebar.warning("⚠️ No serial ports detected.")
-    serial_port = None
 
 baudrate = st.sidebar.number_input("Baud Rate", value=5600000)
-log_duration = st.sidebar.slider("Logging Duration (seconds)", 1, 60, 10)
 machine_type = st.sidebar.selectbox("Machine Type", ("CARDING", "DF", "FLYER"))
-machine_map = {"CARDING": CARDING, "DF": DF, "FLYER": FLYER}
-machine = machine_map[machine_type]
-
-# Initialize session state
-if "log_lines" not in st.session_state:
-    st.session_state.log_lines = []
+machine = {"CARDING": CARDING, "DF": DF, "FLYER": FLYER}[machine_type]
 
 # Setup CAN
 def setup_can(serial_port, baudrate):
@@ -65,46 +54,95 @@ def setup_can(serial_port, baudrate):
     except Exception as e:
         return str(e)
 
-# Log lines from serial port
-def log_from_serial(ser, duration_sec=10):
-    st.session_state.log_lines.clear()
-    start = time.time()
-    log_display = st.empty()
-    while time.time() - start < duration_sec:
-        line = ser.readline().decode("utf-8", errors="ignore").strip()
-        if line:
-            st.session_state.log_lines.append(line)
-            log_display.markdown("```\n" + "\n".join(st.session_state.log_lines[-20:]) + "\n```")
-    return "\n".join(st.session_state.log_lines)
+# Background logging function
+def background_logger(ser, log_file_path, stop_event):
+    while not stop_event.is_set():
+        try:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if line:
+                timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f]")[:-3]
+                full_line = f"{timestamp} {line}"
+                with open(log_file_path, "a") as f:
+                    f.write(full_line + "\n")
+        except Exception:
+            pass
 
-# Run setup & log
-if serial_port and st.sidebar.button("Start CAN Logging"):
-    st.sidebar.write("⏳ Connecting and logging...")
-    result = setup_can(serial_port, baudrate)
-    if isinstance(result, serial.Serial):
-        st.success("✅ CAN configured. Logging started...")
-        log_text = log_from_serial(result, log_duration)
-        with open("can_log.txt", "w") as f:
-            f.write(log_text)
-        result.close()
-        st.success("✅ Logging completed and saved.")
-        uploaded_log = io.BytesIO(log_text.encode("utf-8"))
-    else:
-        st.error(f"❌ Error: {result}")
-        uploaded_log = None
-else:
-    uploaded_log = None
+# Initialize state
+if "is_logging" not in st.session_state:
+    st.session_state.is_logging = False
+if "ser" not in st.session_state:
+    st.session_state.ser = None
+if "log_file_path" not in st.session_state:
+    st.session_state.log_file_path = None
+if "log_thread" not in st.session_state:
+    st.session_state.log_thread = None
+if "stop_event" not in st.session_state:
+    st.session_state.stop_event = None
 
-# Upload alternative log or DBC file
+# Connect button
+if serial_port and not st.session_state.ser:
+    if st.sidebar.button("🔌 Connect to CAN"):
+        result = setup_can(serial_port, baudrate)
+        if isinstance(result, serial.Serial):
+            st.session_state.ser = result
+            st.success("✅ Connected to CAN.")
+        else:
+            st.error(f"❌ Error: {result}")
+
+# Start Logging
+if st.session_state.ser and not st.session_state.is_logging:
+    if st.sidebar.button("▶️ Start Logging"):
+        st.session_state.is_logging = True
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"can_log_{timestamp}.txt"
+        st.session_state.log_file_path = log_filename
+
+        st.session_state.stop_event = threading.Event()
+        thread = threading.Thread(target=background_logger, args=(st.session_state.ser, log_filename, st.session_state.stop_event))
+        thread.start()
+        st.session_state.log_thread = thread
+        st.success("✅ Logging started.")
+
+# Stop Logging
+if st.session_state.is_logging:
+    if st.sidebar.button("⏹️ Stop Logging"):
+        st.session_state.stop_event.set()
+        st.session_state.log_thread.join()
+        st.session_state.is_logging = False
+        if st.session_state.ser:
+            st.session_state.ser.close()
+            st.session_state.ser = None
+        st.success("✅ Logging stopped.")
+
+# Download latest log
+if st.session_state.log_file_path and not st.session_state.is_logging:
+    try:
+        with open(st.session_state.log_file_path, "rb") as f:
+            st.download_button("📥 Download Latest Log", data=f, file_name=st.session_state.log_file_path, mime="text/plain")
+    except FileNotFoundError:
+        st.error("⚠️ Log file not found.")
+
+# Upload section
 st.header("📁 Upload CAN Log and DBC File")
 log_file = st.file_uploader("Upload CAN log file", type=["txt", "log"])
 dbc_file = st.file_uploader("Upload DBC .ods file", type=["ods"])
 flyer_plan_file = st.file_uploader("(Optional) Upload Flyer Plan (.xlsx)", type=["xlsx"])
 
-# Decide input log
-log_input = uploaded_log or log_file
+# Determine input log
+log_input = None
+if st.session_state.log_file_path and not st.session_state.is_logging:
+    try:
+        with open(st.session_state.log_file_path, "rb") as f:
+            log_input = io.BytesIO(f.read())
+    except:
+        pass
+if log_file:
+    log_input = log_file
 
-# Main decoder
+# Decoding logic (unchanged)
+# [Your decoding logic starts here, kept as-is from original script]"
+
+
 if log_input and dbc_file:
     functionIDs = pd.read_excel(dbc_file, engine="odf", index_col=0, sheet_name="FunctionID")
     CardingAddressIDs = pd.read_excel(dbc_file, engine="odf", index_col=0, sheet_name="Carding_IDs")
@@ -169,7 +207,6 @@ if log_input and dbc_file:
                             "usingPosition": data_bytes[19],
                         })
 
-                        # Determine lift side
                         src = linedict.get("source", "").lower()
                         dst = linedict.get("dst", "").lower()
                         if "right" in src or "right" in dst:
@@ -191,11 +228,9 @@ if log_input and dbc_file:
     st.success("✅ Log processed.")
     st.dataframe(df.head(50), height=400)
 
-    # Download CSV
     csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Decoded CSV", csv, "decoded_log.csv", "text/csv")
+    st.download_button("📅 Download Decoded CSV", csv, "decoded_log.csv", "text/csv")
 
-    # Lift-based Excel
     if "LiftSide" in df.columns:
         right_df = df[df["LiftSide"] == "Right Lift"]
         left_df = df[df["LiftSide"] == "Left Lift"]
@@ -207,13 +242,12 @@ if log_input and dbc_file:
 
             with open(tmp.name, "rb") as f:
                 st.download_button(
-                    "📥 Download Left/Right Lift Sheets",
+                    "📅 Download Left/Right Lift Sheets",
                     data=f,
                     file_name="lift_sheets.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
-    # Plotting
     st.subheader("📊 Plot Numeric Data")
     if "LiftSide" in df.columns:
         lift_filter = st.selectbox("Filter by Lift Side", ["All", "Right Lift", "Left Lift"])
@@ -232,7 +266,6 @@ if log_input and dbc_file:
         ax.legend()
         st.pyplot(fig)
 
-    # Optional: Show flyer plan
     if machine == FLYER and flyer_plan_file:
         flyer_df = pd.read_excel(flyer_plan_file)
         st.subheader("📋 Flyer Communication Plan")
